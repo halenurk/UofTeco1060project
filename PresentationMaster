@@ -1,0 +1,126 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+import matplotlib.animation as animation
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# ==========================================
+# 1. PARAMETER TOGGLE
+# ==========================================
+MODE = "ORIGINAL"  
+
+if MODE == "ORIGINAL":
+    V_A, V_B, V_C = 3.0, 2.0, 1.0
+    C_H, C_L = 0.5, 1.2
+    q_A, q_B = 0.30, 0.40
+    title_mode = "Original Parameters (Linear Utility)"
+else:
+    V_A, V_B, V_C = 5.0, 2.0, 0.0
+    C_H, C_L = 0.5, 1.0
+    q_A, q_B = 0.25, 0.45
+    title_mode = "Literature Parameters (Convex Status Premium)"
+
+PARAMS = {
+    'N': 400,               # <--- CHANGED TO 400 (Must be a perfect square: 100, 400, 900)
+    'rounds': 200,          
+    'learning_rate': 0.1,   
+    'epsilon': 0.05,        
+    'theta_H': 2.0, 'theta_L': 1.0,
+    'C_H': C_H, 'C_L': C_L,
+    'V_A': V_A, 'V_B': V_B, 'V_C': V_C,
+    'q_A': q_A, 'q_B': q_B,
+    'alpha': 15.0, 'beta': 20.0, 'base_boost': 20.0, 'delta': 10.0
+}
+
+# DYNAMIC GRID CALCULATION
+# This automatically figures out how big the square grid needs to be.
+GRID_SIDE = int(np.sqrt(PARAMS['N']))
+if GRID_SIDE * GRID_SIDE != PARAMS['N']:
+    raise ValueError(f"N={PARAMS['N']} is not a perfect square. Please use 100, 400, 900, etc.")
+
+# ==========================================
+# 2. THE SIMULATION ENGINE
+# ==========================================
+def run_simulation_history(p_high, regime="RELATIVE", T_A=75, T_B=55):
+    N = PARAMS['N']
+    is_high_skill = np.zeros(N, dtype=bool)
+    is_high_skill[:int(round(N * p_high))] = True
+    
+    thetas = np.where(is_high_skill, PARAMS['theta_H'], PARAMS['theta_L'])
+    costs = np.where(is_high_skill, PARAMS['C_H'], PARAMS['C_L'])
+    
+    Q_table = np.ones((N, 2)) * PARAMS['V_A']
+    grid_history = []
+    
+    for r in range(PARAMS['rounds']):
+        explore = np.random.rand(N) < PARAMS['epsilon']
+        efforts = np.where(explore, np.random.choice([0, 1], size=N), np.argmax(Q_table, axis=1))
+        
+        # DYNAMIC RESHAPE: Uses the dynamically calculated side length instead of (10, 10)
+        grid_history.append(efforts.reshape((GRID_SIDE, GRID_SIDE)).copy())
+        
+        noise = np.random.uniform(-PARAMS['delta'], PARAMS['delta'], size=N)
+        scores = PARAMS['alpha'] * efforts + PARAMS['beta'] * thetas + PARAMS['base_boost'] + noise
+        
+        if regime == "RELATIVE":
+            ranks = np.argsort(np.argsort(scores))
+            cutoff_A = int(N * (1 - PARAMS['q_A']))
+            cutoff_B = int(N * (1 - (PARAMS['q_A'] + PARAMS['q_B'])))
+            payoffs = np.where(ranks >= cutoff_A, PARAMS['V_A'], 
+                      np.where(ranks >= cutoff_B, PARAMS['V_B'], PARAMS['V_C']))
+        else:
+            payoffs = np.where(scores >= T_A, PARAMS['V_A'], 
+                      np.where(scores >= T_B, PARAMS['V_B'], PARAMS['V_C']))
+            
+        utilities = payoffs - (efforts * costs)
+        lr = PARAMS['learning_rate']
+        Q_table[np.arange(N), efforts] = (1 - lr) * Q_table[np.arange(N), efforts] + lr * utilities
+        
+    return grid_history
+
+# ==========================================
+# 3. GIF GENERATOR
+# ==========================================
+def create_convergence_gif():
+    np.random.seed(1060)
+    p_val = 0.50
+    print(f"Running simulation history for {MODE} parameters with N={PARAMS['N']}...")
+    history = run_simulation_history(p_val, regime="RELATIVE")
+    
+    fig, ax = plt.subplots(figsize=(6, 6))
+    fig.patch.set_facecolor('#f4f4f4')
+    cmap = ListedColormap(['#ff4c4c', '#4cff4c'])
+    
+    mat = ax.imshow(history[0], cmap=cmap, vmin=0, vmax=1)
+    
+    # DYNAMIC BOUNDARY LINE: Multiplies p_val by the dynamic grid side length
+    ax.axhline(y=p_val * GRID_SIDE - 0.5, color='black', linewidth=4, linestyle='-')
+    
+    ax.set_xticks([])
+    ax.set_yticks([])
+    
+    title_text = ax.set_title(f"Q-Learning Convergence (Round 0)\n{title_mode}", 
+                              fontsize=14, fontweight='bold', pad=15)
+                              
+    info_text = (f"Regime: Relative Grading "
+                 f"Demographics: 50% High-Skill\n"
+                 f"Class Size: {PARAMS['N']} Students "
+                 f"V_A={PARAMS['V_A']}, V_B={PARAMS['V_B']}, V_C={PARAMS['V_C']}")
+    ax.set_xlabel(info_text, fontsize=12, labelpad=15)
+    
+    def update(frame):
+        mat.set_data(history[frame])
+        title_text.set_text(f"Q-Learning Convergence (Round {frame})\n{title_mode}")
+        return [mat, title_text]
+
+    print("Generating GIF (this may take a bit longer with 400 students)...")
+    ani = animation.FuncAnimation(fig, update, frames=PARAMS['rounds'], interval=50, blit=False)
+    
+    filename = f"visual_3_convergence_{MODE.lower()}_N{PARAMS['N']}.gif"
+    ani.save(filename, writer='pillow', fps=15)
+    print(f"Successfully saved {filename}!")
+
+if __name__ == "__main__":
+    create_convergence_gif()
