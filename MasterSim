@@ -1,0 +1,383 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+import matplotlib.patches as mpatches
+import matplotlib.lines as mlines
+import csv
+import warnings
+import time
+
+warnings.filterwarnings('ignore')
+
+# ==========================================
+# 1. PARAMETER UNIVERSES
+# ==========================================
+# Shared algorithmic and scoring parameters
+SHARED_PARAMS = {
+    'N': 100,                
+    'rounds': 1000,          
+    'learning_rate': 0.05,   
+    'epsilon': 0.05,         
+    'theta_L': 1.0, 'theta_H': 2.0,          
+    'C_H': 0.5,              
+    'alpha': 15.0, 'beta': 20.0, 'base_boost': 20.0, 'delta': 10.0,
+    'omega_H': 0.9, 'omega_L': 0.1,          
+}
+
+# The two distinct economic environments
+PARAM_PROFILES = {
+    'original': {
+        **SHARED_PARAMS,
+        'utility_type': "Linear Utility",
+        'V_A': 3.0, 'V_B': 2.0, 'V_C': 1.0,              
+        'C_L': 1.2,              
+        'q_A': 0.30, 'q_B': 0.40,             
+    },
+    'literature': {
+        **SHARED_PARAMS,
+        'utility_type': "Convex Status Premium",
+        'V_A': 5.0, 'V_B': 2.0, 'V_C': 0.0,              
+        'C_L': 1.0,              
+        'q_A': 0.25, 'q_B': 0.45,             
+    }
+}
+
+# ==========================================
+# 2. UNIVERSAL HELPER FUNCTIONS
+# ==========================================
+def add_metadata_stamp(fig, params, x_pos=1.02, y_pos=0.5):
+    """Universal stamp that dynamically reads the active parameter profile."""
+    stamp_text = (
+        f"$\\bf{{Framework:}}$ {params['utility_type']}\n"
+        "------------------\n"
+        f"$\\bf{{Payoffs:}}$ $V_A={params['V_A']}$, $V_B={params['V_B']}$, $V_C={params['V_C']}$\n"
+        f"$\\bf{{Costs:}}$ $C_H={params['C_H']}$, $C_L={params['C_L']}$\n"
+        f"$\\bf{{Skill (\\theta):}}$ $\\theta_H={params['theta_H']}$, $\\theta_L={params['theta_L']}$\n"
+        f"$\\bf{{Prof\\ Weights:}}$ $\\omega_H={params['omega_H']}$, $\\omega_L={params['omega_L']}$\n"
+        "------------------\n"
+        "$\\bf{Production\\ Function}$\n"
+        f"$S = {params['alpha']}e + {params['beta']}\\theta + {params['base_boost']} \\pm {params['delta']}$\n"
+        "------------------\n"
+        "$\\bf{Relative\\ Quotas}$\n"
+        f"$q_A={params['q_A']}$, $q_B={params['q_B']}$\n"
+    )
+    fig.text(x_pos, y_pos, stamp_text, fontsize=10, va='center', ha='left',
+             bbox=dict(facecolor='#f8f9fa', edgecolor='#ced4da', boxstyle='round,pad=0.8', alpha=0.9))
+
+def expected_prob(threshold, effort, theta, params):
+    base_score = params['alpha'] * effort + params['beta'] * theta + params['base_boost']
+    target_noise = threshold - base_score
+    if target_noise <= -params['delta']: return 1.0
+    elif target_noise >= params['delta']: return 0.0
+    else: return (params['delta'] - target_noise) / (2 * params['delta'])
+
+def theoretical_best_response(theta, cost_val, T_A, T_B, params):
+    EU = {}
+    for e in [0, 1]:
+        cost = cost_val if e == 1 else 0
+        p_A = expected_prob(T_A, e, theta, params)
+        p_B = expected_prob(T_B, e, theta, params)
+        EU[e] = params['V_C'] + (params['V_A'] - params['V_B']) * p_A + (params['V_B'] - params['V_C']) * p_B - cost
+    return 1 if EU[1] > EU[0] else 0
+
+# ==========================================
+# 3. ABSOLUTE GRADING ENGINE
+# ==========================================
+def get_theoretical_W(T_A, T_B, params):
+    e_H = theoretical_best_response(params['theta_H'], params['C_H'], T_A, T_B, params)
+    e_L = theoretical_best_response(params['theta_L'], params['C_L'], T_A, T_B, params)
+    return params['omega_H'] * e_H + params['omega_L'] * e_L
+
+def run_absolute_simulation(T_A, T_B, p_high, params):
+    N = params['N']
+    is_high = np.zeros(N, dtype=bool)
+    num_high = int(round(N * p_high))
+    is_high[:num_high] = True
+    
+    thetas = np.where(is_high, params['theta_H'], params['theta_L'])
+    costs = np.where(is_high, params['C_H'], params['C_L'])
+    Q_table = np.ones((N, 2)) * params['V_A']
+    
+    hist_e_H, hist_e_L = [], []
+    
+    for r in range(params['rounds']):
+        explore = np.random.rand(N) < params['epsilon']
+        efforts = np.where(explore, np.random.choice([0, 1], size=N), np.argmax(Q_table, axis=1))
+        
+        noise = np.random.uniform(-params['delta'], params['delta'], size=N)
+        scores = params['alpha'] * efforts + params['beta'] * thetas + params['base_boost'] + noise
+        
+        payoffs = np.where(scores >= T_A, params['V_A'], np.where(scores >= T_B, params['V_B'], params['V_C']))
+        utils = payoffs - (efforts * costs)
+        
+        lr = params['learning_rate']
+        Q_table[np.arange(N), efforts] = (1 - lr) * Q_table[np.arange(N), efforts] + lr * utils
+
+        if r >= params['rounds'] - 50:
+            hist_e_H.append(np.mean(efforts[is_high]) if num_high > 0 else 0)
+            hist_e_L.append(np.mean(efforts[~is_high]) if num_high < N else 0)
+
+    e_H_mean, e_L_mean = np.mean(hist_e_H), np.mean(hist_e_L)
+    W = params['omega_H'] * e_H_mean + params['omega_L'] * e_L_mean
+    
+    grid_side = int(np.sqrt(N))
+    return W, efforts.reshape((grid_side, grid_side)), e_H_mean, e_L_mean
+
+def find_optimal_policy(p_high, params, mode='empirical'):
+    T_A_vals = np.arange(90.0, 35.0, -5.0)
+    T_B_vals = np.arange(40.0, 95.0, 5.0)
+    
+    max_W = -np.inf
+    opt_T_A, opt_T_B, best_grid = None, None, None
+    
+    for t_a in T_A_vals:
+        for t_b in T_B_vals:
+            if t_b >= t_a: continue
+            
+            if mode == 'empirical':
+                W, grid, _, _ = run_absolute_simulation(t_a, t_b, p_high, params)
+            else:
+                W = get_theoretical_W(t_a, t_b, params)
+                grid = None
+            
+            if W > max_W + 1e-6:
+                max_W, opt_T_A, opt_T_B, best_grid = W, t_a, t_b, grid
+            elif abs(W - max_W) < 1e-6:
+                if opt_T_A is None or t_a < opt_T_A:
+                    opt_T_A, opt_T_B, best_grid = t_a, t_b, grid
+                    
+    return opt_T_A, opt_T_B, best_grid
+
+# ==========================================
+# 4. RELATIVE GRADING ENGINE
+# ==========================================
+def run_relative_simulation(p_high, params):
+    N = params['N']
+    is_high = np.zeros(N, dtype=bool)
+    num_high = int(round(N * p_high))
+    is_high[:num_high] = True
+    
+    thetas = np.where(is_high, params['theta_H'], params['theta_L'])
+    costs = np.where(is_high, params['C_H'], params['C_L'])
+    Q_table = np.ones((N, 2)) * params['V_A']
+    
+    hist_e_H, hist_e_L = [], []
+    
+    for r in range(params['rounds']):
+        explore = np.random.rand(N) < params['epsilon']
+        efforts = np.where(explore, np.random.choice([0, 1], size=N), np.argmax(Q_table, axis=1))
+        
+        noise = np.random.uniform(-params['delta'], params['delta'], size=N)
+        scores = params['alpha'] * efforts + params['beta'] * thetas + params['base_boost'] + noise
+        
+        ranks = np.argsort(np.argsort(scores))
+        c_A = int(N * (1 - params['q_A']))
+        c_B = int(N * (1 - (params['q_A'] + params['q_B'])))
+        
+        payoffs = np.where(ranks >= c_A, params['V_A'], np.where(ranks >= c_B, params['V_B'], params['V_C']))
+        utils = payoffs - (efforts * costs)
+        
+        lr = params['learning_rate']
+        Q_table[np.arange(N), efforts] = (1 - lr) * Q_table[np.arange(N), efforts] + lr * utils
+
+        if r >= params['rounds'] - 50:
+            hist_e_H.append(np.mean(efforts[is_high]) if num_high > 0 else 0)
+            hist_e_L.append(np.mean(efforts[~is_high]) if num_high < N else 0)
+
+    grid_side = int(np.sqrt(N))
+    return np.mean(hist_e_H), np.mean(hist_e_L), efforts.reshape((grid_side, grid_side))
+
+# ==========================================
+# 5. VISUALIZATION MODULES
+# ==========================================
+def plot_abs_statics(data, params, filename):
+    fig, ax = plt.subplots(figsize=(12, 7))
+    plt.subplots_adjust(right=0.75)
+    
+    ax.plot(data['p'], data['t_ta'], 'o--', color='darkblue', markerfacecolor='none', lw=2, ms=8, label=r'Theoretical $T_A^*$')
+    ax.plot(data['p'], data['t_tb'], 's--', color='darkorange', markerfacecolor='none', lw=2, ms=8, label=r'Theoretical $T_B^*$')
+    ax.plot(data['p'], data['e_ta'], 'o-', color='blue', lw=2.5, label=r'Empirical $T_A^*$')
+    ax.plot(data['p'], data['e_tb'], 's-', color='orange', lw=2.5, label=r'Empirical $T_B^*$')
+    
+    ax.set_title(f"Absolute Grading: Principal's Reaction Function\n({params['utility_type']})", fontsize=15)
+    ax.set_xlabel("Proportion of High-Skill Students ($p$)", fontsize=13)
+    ax.set_ylabel("Grading Threshold (40-90 Scale)", fontsize=13)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.legend(loc='lower left')
+    
+    add_metadata_stamp(fig, params)
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_filmstrip(data, params, title, filename):
+    target_ps = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    fig, axes = plt.subplots(1, 9, figsize=(18, 4))
+    fig.patch.set_facecolor('#f4f4f4')
+    cmap = ListedColormap(['#ff4c4c', '#4cff4c'])
+    grid_side = int(np.sqrt(params['N']))
+    
+    for idx, p in enumerate(target_ps):
+        ax = axes[idx]
+        grid_data = data['grids'][round(p, 2)]
+        if isinstance(grid_data, tuple): grid = grid_data[2]
+        else: grid = grid_data 
+            
+        ax.imshow(grid, cmap=cmap, vmin=0, vmax=1)
+        ax.axhline(y=p * grid_side - 0.5, color='black', lw=4)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f"$p = {p:.1f}$", fontweight='bold')
+
+    plt.suptitle(f"{title} ({params['utility_type']})", fontsize=16, fontweight='bold', y=1.15)
+    
+    # Explicit Presentation Legend
+    work_patch = mpatches.Patch(color='#4cff4c', label='Green: Working')
+    shirk_patch = mpatches.Patch(color='#ff4c4c', label='Red: Shirking')
+    line_legend = mlines.Line2D([], [], color='black', lw=4, label='Black Line: High-Skill Above, Low-Skill Below')
+    
+    fig.legend(handles=[work_patch, shirk_patch, line_legend], 
+               loc='lower center', ncol=3, fontsize=13, bbox_to_anchor=(0.5, -0.2))
+               
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_rel_tipping(data, params, filename):
+    fig, ax = plt.subplots(figsize=(12, 7))
+    plt.subplots_adjust(right=0.75)
+    
+    ax.plot(data['p'], data['e_H'], 'o-', color='blue', lw=2.5, label=r'High-Skill Effort ($e_H$)')
+    ax.plot(data['p'], data['e_L'], 's-', color='red', lw=2.5, label=r'Low-Skill Effort ($e_L$)')
+    ax.axvline(x=params['q_A'], color='goldenrod', linestyle='--', lw=2, label=r'A-Grade Quota ($q_A$)')
+    
+    ax.set_title(f"Relative Grading: Demographic Tipping Point\n({params['utility_type']})", fontsize=15)
+    ax.set_xlabel("Proportion of High-Skill Students ($p$)", fontsize=13)
+    ax.set_ylabel("Equilibrium Proportion Working", fontsize=13)
+    ax.grid(True, ls='--', alpha=0.6)
+    ax.legend(loc='center right')
+    
+    add_metadata_stamp(fig, params)
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_robustness(data, params, title, xlabel, x_key, vline=None, filename=''):
+    fig, ax = plt.subplots(figsize=(12, 7))
+    plt.subplots_adjust(right=0.75)
+    
+    ax.plot(data[x_key], data['e_H'], 'o-', color='blue', lw=2.5, label=r'High-Skill Effort')
+    ax.plot(data[x_key], data['e_L'], 's-', color='red', lw=2.5, label=r'Low-Skill Effort')
+    if vline: ax.axvline(x=vline, color='gray', ls='--', lw=2, label='Baseline')
+    
+    ax.set_title(f"{title}\n({params['utility_type']})", fontsize=15)
+    ax.set_xlabel(xlabel, fontsize=13)
+    ax.set_ylabel("Equilibrium Proportion Working", fontsize=13)
+    ax.grid(True, ls='--', alpha=0.6)
+    ax.legend(loc='lower left')
+    
+    add_metadata_stamp(fig, params)
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_omega_comparison(p_vals, t_ta_09, t_ta_05, params, filename):
+    fig, ax = plt.subplots(figsize=(12, 7))
+    plt.subplots_adjust(right=0.75)
+    
+    ax.plot(p_vals, t_ta_09, 'o-', color='purple', lw=2.5, label=r'Elitist Prof ($\omega_H=0.9$) $T_A^*$')
+    ax.plot(p_vals, t_ta_05, 's-', color='green', lw=2.5, label=r'Egalitarian Prof ($\omega_H=0.5$) $T_A^*$')
+    
+    ax.set_title(f"Robustness Check: Principal Weights vs Threshold Severity\n({params['utility_type']})", fontsize=15)
+    ax.set_xlabel("Proportion of High-Skill Students ($p$)", fontsize=13)
+    ax.set_ylabel("Theoretical Optimal A-Grade Threshold", fontsize=13)
+    ax.grid(True, ls='--', alpha=0.6)
+    ax.legend(loc='lower left')
+    
+    add_metadata_stamp(fig, params)
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+# ==========================================
+# 6. MASTER EXECUTION SUITE
+# ==========================================
+if __name__ == "__main__":
+    np.random.seed(1060)
+    p_values = np.linspace(0.05, 0.95, 19)
+    start_time = time.time()
+    
+    print("==================================================")
+    print("STARTING ECO1060 ULTIMATE SIMULATION SUITE")
+    print("==================================================\n")
+
+    for profile_name, active_params in PARAM_PROFILES.items():
+        print(f"\n>>>> COMMENCING SWEEP: {profile_name.upper()} PARAMETERS <<<<\n")
+
+        # --- MODULE 1: ABSOLUTE GRADING ---
+        print(f"--> [1/4] Running Absolute Grading Sweep ({profile_name})...")
+        abs_data = {'p': [], 't_ta': [], 't_tb': [], 'e_ta': [], 'e_tb': [], 'grids': {}}
+        for p in p_values:
+            tt_a, tt_b, _ = find_optimal_policy(p, active_params, 'theoretical')
+            et_a, et_b, grid = find_optimal_policy(p, active_params, 'empirical')
+            abs_data['p'].append(p)
+            abs_data['t_ta'].append(tt_a); abs_data['t_tb'].append(tt_b)
+            abs_data['e_ta'].append(et_a); abs_data['e_tb'].append(et_b)
+            abs_data['grids'][round(p, 2)] = (et_a, et_b, grid)
+        
+        plot_abs_statics(abs_data, active_params, f'visual_1_absolute_statics_{profile_name}.png')
+        plot_filmstrip(abs_data, active_params, "Absolute Grading Equilibria", f'visual_2_absolute_filmstrip_{profile_name}.png')
+
+        # --- MODULE 2: RELATIVE GRADING ---
+        print(f"--> [2/4] Running Relative Grading Sweep ({profile_name})...")
+        rel_data = {'p': [], 'e_H': [], 'e_L': [], 'grids': {}}
+        for p in p_values:
+            eh, el, grid = run_relative_simulation(p, active_params)
+            rel_data['p'].append(p)
+            rel_data['e_H'].append(eh); rel_data['e_L'].append(el)
+            rel_data['grids'][round(p, 2)] = grid
+            
+        plot_rel_tipping(rel_data, active_params, f'visual_4_relative_tipping_{profile_name}.png')
+        plot_filmstrip(rel_data, active_params, "Relative Grading Equilibria", f'visual_5_relative_filmstrip_{profile_name}.png')
+
+        # --- MODULE 3: EXAM NOISE ROBUSTNESS ---
+        print(f"--> [3/4] Running Noise Robustness Sweep at p=0.50 ({profile_name})...")
+        noise_data = {'delta': [], 'e_H': [], 'e_L': []}
+        d_vals = np.linspace(1, 30, 30)
+        for d in d_vals:
+            temp_params = active_params.copy()
+            temp_params['delta'] = d
+            eh, el, _ = run_relative_simulation(0.50, temp_params)
+            noise_data['delta'].append(d)
+            noise_data['e_H'].append(eh); noise_data['e_L'].append(el)
+            
+        plot_robustness(noise_data, active_params, "Robustness Check: Exam Noise", 
+                        r"Exam Noise Amplitude ($\pm \delta$)", 'delta', 10.0, f'visual_6_noise_robustness_{profile_name}.png')
+
+        # --- MODULE 4: OMEGA ROBUSTNESS ---
+        print(f"--> [4/4] Running Professor Weights Robustness Sweep ({profile_name})...")
+        egal_params = active_params.copy()
+        egal_params['omega_H'] = 0.5
+        egal_params['omega_L'] = 0.5
+        
+        egal_t_ta = []
+        for p in p_values:
+            tt_a, _, _ = find_optimal_policy(p, egal_params, 'theoretical')
+            egal_t_ta.append(tt_a)
+            
+        plot_omega_comparison(p_values, abs_data['t_ta'], egal_t_ta, egal_params, f'visual_7_omega_robustness_{profile_name}.png')
+
+        # --- EXPORT DATA ---
+        print(f"--> Exporting CSV records ({profile_name})...")
+        with open(f'data_absolute_{profile_name}.csv', 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['p', 'Theo_TA', 'Theo_TB', 'Emp_TA', 'Emp_TB', 'Egal_Theo_TA'])
+            for i in range(len(p_values)):
+                w.writerow([round(p_values[i], 2), abs_data['t_ta'][i], abs_data['t_tb'][i], 
+                            abs_data['e_ta'][i], abs_data['e_tb'][i], egal_t_ta[i]])
+                
+        with open(f'data_relative_{profile_name}.csv', 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['p', 'High_Effort', 'Low_Effort'])
+            for i in range(len(p_values)):
+                w.writerow([round(p_values[i], 2), rel_data['e_H'][i], rel_data['e_L'][i]])
+
+    elapsed = time.time() - start_time
+    print(f"\n==================================================")
+    print(f"SUCCESS! Entire catalog generated in {elapsed:.1f} seconds.")
+    print("==================================================")
